@@ -20,6 +20,7 @@ function sourceText(source,target){
 function sourceNorm(source,target,omit=false){return norm(sourceText(source,target).text,omit);}
 function align(target,source,partial=false,omit=false){
   const clean=sourceText(source,target),r=core.align(target,clean.text,partial,omit);if(!r)return null;
+  r.sourceStart=clean.map[r.sourceStart]??source.length;r.sourceEnd=r.sourceEnd?clean.map[r.sourceEnd-1]+1:0;
   r.refSpans=r.refSpans.map(s=>({start:clean.map[s.start],end:clean.map[s.end-1]+1}));return r;
 }
 function sentences(s){let result=[],start=0;for(let i=0;i<s.length;i++){
@@ -108,8 +109,23 @@ function targetData(doc,source=null){const items=[],questions=new Set();let rang
     if(layout==='inline'&&op&&tr.length>8){add(p,op[0].length,t.length,'option',q+'번 '+choice+' 선지');continue;}
     if(layout==='inline'&&/^\s*ⓑ\s*[:：]/.test(t)&&choice){add(p,0,t.length,'option-cont',q+'번 '+choice+' 선지 ⓑ');continue;}
     if(layout==='inline'&&/^\s*<보기>/.test(t)){const start=t.indexOf('<보기>')+4;let cursor=start;for(const e of t.slice(start).matchAll(/\(\s*[…⋯]+\s*\)|[…⋯]+|\.{3,}/g)){add(p,cursor,start+e.index,'view',q+'번 <보기> 발췌');cursor=start+e.index+e[0].length;}add(p,cursor,t.length,'view',q+'번 <보기> 발췌');continue;}
-    if(layout==='separate'||layout==='workbook'||/^\s*▶/.test(t)){for(const quote of t.matchAll(/‘([^’]*)’|“([^”]*)”|「([^」]*)」|『([^』]*)』/g)){const inner=quote[1]??quote[2]??quote[3]??quote[4];if(!norm(inner))continue;const tail=t.slice(quote.index+quote[0].length,quote.index+quote[0].length+30);const definition=/^\s*(?:라는|라는? 뜻|의|이라는|란)?\s*(?:의미|뜻)/.test(tail);add(p,quote.index+1,quote.index+1+inner.length,definition?'definition':'quote',q+'번 '+choice+(definition?' 뜻풀이':' 해설 인용'),{short:norm(inner).length<8});}}
+    if(layout==='separate'||layout==='workbook'||/^\s*▶/.test(t)){for(const quote of t.matchAll(/‘([^’]*)’|“([^”]*)”|「([^」]*)」|『([^』]*)』/g)){const inner=quote[1]??quote[2]??quote[3]??quote[4];if(!norm(inner))continue;const tail=t.slice(quote.index+quote[0].length,quote.index+quote[0].length+30);const definition=shortBaseForm(inner)||/^\s*(?:라는|라는? 뜻|의|이라는|란)?\s*(?:의미|뜻)/.test(tail);add(p,quote.index+1,quote.index+1+inner.length,definition?'definition':'quote',q+'번 '+choice+(definition?' 뜻풀이':' 해설 인용'),{short:norm(inner).length<8});}}
   }return {items,available:[...questions].sort((a,b)=>a-b),layout};
+}
+// Short dictionary-form expressions are excluded, not declared to match.
+function shortBaseForm(text){const t=text.trim();return /^[가-힣\s]+다\.?$/.test(t)&&norm(t).replace(/\.$/,'').length<=8;}
+function partialCandidates(blocks,text,omit){
+  const unique=new Map(),n=norm(text).length;
+  for(const b of blocks){
+    const diff=align(text,b.text,true,omit);if(!diff)continue;
+    const score=1-diff.cost/n;if(score<.82)continue;
+    // The same excerpt can occur in overlapping source blocks or choices.
+    // Compare excerpt content rather than treating each containing block as a rival.
+    const excerpt=b.text.slice(diff.sourceStart,diff.sourceEnd);
+    const key=sourceNorm(excerpt,text,omit)+'|'+JSON.stringify(diff.changes);
+    if(!unique.has(key))unique.set(key,{...b,score});
+  }
+  return [...unique.values()].sort((a,b)=>b.score-a.score);
 }
 function windows(blocks,text){let count=sentences(text).length,out=[];for(const b of blocks){let ss=sentences(b.text);for(let i=0;i<ss.length;i++)for(let size=Math.max(1,count-1);size<=count+1&&i+size<=ss.length;size++)out.push({...b,text:b.text.slice(ss[i].start,ss[i+size-1].end),sn:i+1});}return out;}
 function compare(target,reference,opts={}){
@@ -147,8 +163,11 @@ function compare(target,reference,opts={}){
     if(!direct){const hits=[...scope,...blocks].filter(exact);if(hits.length){direct=hits[0];partial=true;reason='연속된 원문 구간과 대조';}
       else if(it.short)return unknown(it,'짧은 용어·표현은 원문 인용 여부를 확인해 주세요.',null,'review');
       else if(it.kind!=='analysis-source'&&it.kind!=='evidence'&&it.kind!=='option'&&it.kind!=='option-cont'){
-        const scored=ranked(windows(blocks,it.text),it,omit),best=scored[0],next=scored[1];if(best?.score>=.65&&(!next||best.score-next.score>=.07)){direct=best;partial=true;reason='유사한 원문 구간과 대조 · 연결 위치 확인 필요';}
-        else return unknown(it,'대응을 확정하지 못했습니다. 원문에 없는 오류라고 단정하지 않습니다.',best?.score>.25?best:null);
+        const excerpts=partialCandidates(blocks,it.text,omit),top=excerpts[0],runner=excerpts[1];
+        if(top&&(!runner||top.score-runner.score>=.07)){direct=top;partial=true;reason='인용에 대응하는 원문 내부 구간과 대조 · 인용 밖 앞뒤 내용 제외';}
+        else if(top)return unknown(it,'비슷한 원문 구간이 여러 곳이라 대응을 확정하지 못했습니다.',top);
+        else {const scored=ranked(windows(blocks,it.text),it,omit),best=scored[0],next=scored[1];if(best?.score>=.65&&(!next||best.score-next.score>=.07)){direct=best;partial=true;reason='유사한 원문 구간과 대조 · 연결 위치 확인 필요';}
+        else return unknown(it,'대응을 확정하지 못했습니다. 원문에 없는 오류라고 단정하지 않습니다.',best?.score>.25?best:null);}
       }
     }
     if(!direct)return {...unknown(it,'대응 원문을 찾지 못했습니다.'),location};
