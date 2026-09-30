@@ -29,14 +29,24 @@ function sentences(s){let result=[],start=0;for(let i=0;i<s.length;i++){
   let a=start;while(a<end&&/\s/.test(s[a]))a++;if(a<end)result.push({text:s.slice(a,end),start:a,end});start=end;i=end-1;
 }let a=start,b=s.length;while(a<b&&/\s/.test(s[a]))a++;while(b>a&&/\s/.test(s[b-1]))b--;if(a<b)result.push({text:s.slice(a,b),start:a,end:b});return result;}
 function similarity(a,b){if(a===b)return 1;const grams=s=>new Set(Array.from({length:Math.max(0,s.length-1)},(_,i)=>s.slice(i,i+2)));let aa=grams(a),bb=grams(b),n=0;for(let x of aa)if(bb.has(x))n++;return aa.size+bb.size?2*n/(aa.size+bb.size):0;}
-function trackOf(t,prev){return /(?:국어 영역|선택\s*과목).*화법과 작문/.test(t)?'화작':/(?:국어 영역|선택\s*과목).*언어와 매체/.test(t)?'언매':prev;}
+function trackOf(t,prev){return /^(?:국어 영역|선택\s*과목).*화법과 작문/.test(t)?'화작':/^(?:국어 영역|선택\s*과목).*언어와 매체/.test(t)?'언매':prev;}
+// Reassemble a plain choice table only after validating all five rows.
+function optionTableRows(paragraphs){const rows=paragraphs.filter(p=>p.text.trim()),out=[];
+  for(let i=0;i<rows.length;i++){
+    let j=i,headers=[];while(j<rows.length&&/^[ⓐ-ⓩ]$/.test(rows[j].text.trim()))headers.push(rows[j++].text.trim());
+    if(headers.length>=2&&headers.length<=5){const rebuilt=[];let valid=true;
+      for(const c of choices){if(rows[j]?.text.trim()!==c){valid=false;break;}const p=rows[j++],cells=rows.slice(j,j+headers.length);if(cells.length!==headers.length||cells.some(x=>/[①②③④⑤]|[.!?。]/.test(x.text)||norm(x.text).length>30)){valid=false;break;}rebuilt.push({...p,text:c+cells.map((x,k)=>headers[k]+':'+x.text.trim()).join(' ')});j+=headers.length;}
+      if(valid){out.push(...rebuilt);i=j-1;continue;}
+    }out.push(rows[i]);
+  }return out;
+}
 function detectRanges(...docs){const found=new Map();for(const doc of docs)for(const p of doc.paragraphs){const t=p.text.trim(),m=t.match(rangeRE);if(!m)continue;const category=t.slice(m[0].length).match(/^\s*[（(]?\s*(과학|기술)(?=[)）\s:：·ㆍ/]|$)/);if(!category)continue;const key=m[1]+'-'+m[2];if(!found.has(key))found.set(key,{range:key,start:+m[1],end:+m[2],subjects:[]});const x=found.get(key);if(!x.subjects.includes(category[1]))x.subjects.push(category[1]);}return [...found.values()].sort((a,b)=>a.start-b.start);}
 function sourceIndex(doc){const pool=[],paragraphs=[],blocks=[],options=new Map();let range='',track='공통',q=0,pn=0,part='',passage=false,last='',optionKey='';
-  for(const p of doc.paragraphs){let t=p.text.trim();if(!t)continue;track=trackOf(t,track);let m=t.match(rangeRE);if(m){range=m[1]+'-'+m[2];if(+m[1]<35)track='공통';q=+m[1];pn=0;part='';passage=true;last='';optionKey='';continue;}if(!range)continue;
+  for(const p of optionTableRows(doc.paragraphs)){let t=p.text.trim();if(!t)continue;track=trackOf(t,track);let m=t.match(rangeRE);if(m){range=m[1]+'-'+m[2];if(+m[1]<35)track='공통';q=+m[1];pn=0;part='';passage=true;last='';optionKey='';continue;}if(!range)continue;
     if(/저작권|제\d교시|학년도.*(?:모의|감수)|^국어 영역|^홀수형|^짝수형/.test(t))continue;
     if(/^\[글의 초고\]$/.test(t)){pn=0;part='';passage=true;continue;}
     const sub=t.match(/^\(([가나다])\)(?:\s+|$)/);if(sub&&passage){part=sub[1];pn=0;t=t.slice(sub[0].length).trim();if(!t)continue;}
-    let op=t.match(/^([①②③④⑤])\s*(.+)/s);if(op&&op[2].length>5){if(op[1]==='①'&&last==='⑤')q++;last=op[1];passage=false;optionKey=[track,range,q,op[1]].join(':');const item={text:op[2],range,track,q,kind:'option',label:q+'번 '+op[1],paraId:p.id};options.set(optionKey,item);pool.push(item);blocks.push(item);continue;}
+    let op=t.match(/^([①②③④⑤])\s*(.+)/s);if(op){if(op[1]==='①'&&last==='⑤')q++;last=op[1];passage=false;optionKey=[track,range,q,op[1]].join(':');const item={text:op[2],range,track,q,kind:'option',label:q+'번 '+op[1],paraId:p.id};options.set(optionKey,item);pool.push(item);blocks.push(item);continue;}
     if(/^ⓑ\s*[:：]/.test(t)&&optionKey){const item=options.get(optionKey);if(item){item.cont=t;pool.push({...item,text:t,label:item.label+' ⓑ'});}continue;}
     if(/것은[?？]|물음에 답/.test(t)||/^\s*\d+[.)]\s/.test(t)){passage=false;continue;}
     if(norm(t).length<10)continue;
@@ -46,8 +56,30 @@ function sourceIndex(doc){const pool=[],paragraphs=[],blocks=[],options=new Map(
   }return {pool,paragraphs,blocks,options};
 }
 function targetData(doc,source=null){const items=[],questions=new Set();let range='',q=0,choice='',track='공통',analysis=false,pn=0,part='',first=false,active=false,layout='inline',answer='',subject='';
+  let workbookStep='',workbookChoice=0;
   const add=(p,start,end,kind,label,extra={})=>{while(start<end&&/\s/.test(p.text[start]))start++;while(end>start&&/\s/.test(p.text[end-1]))end--;if(start>=end)return;items.push({id:items.length,paraId:p.id,start,end,text:p.text.slice(start,end),kind,label,range,q:analysis?null:q,choice,track,analysis,pn,part,...extra});};
   for(let pi=0;pi<doc.paragraphs.length;pi++){const p=doc.paragraphs[pi],t=p.text,tr=t.trim();if(!tr)continue;track=trackOf(tr,track);
+    // Workbook headings: standalone question number, skill title, error rate,
+    // then |정답②. The answer table at the front is not a question heading.
+    if(/^\d{1,2}$/.test(tr)){
+      const ahead=doc.paragraphs.slice(pi+1).filter(p=>p.text.trim()).slice(0,3);
+      if(ahead.length===3&&/예상\s*오답률/.test(ahead[1].text)&&/^\s*[|｜]\s*정답\s*[①②③④⑤]/.test(ahead[2].text)){
+        q=+tr;const ranges=[...new Set((source?.blocks||[]).filter(s=>{const [a,b]=s.range.split('-').map(Number);return q>=a&&q<=b;}).map(s=>s.range))];
+        range=ranges.length===1?ranges[0]:'';active=true;analysis=false;layout='workbook';part='';choice='';questions.add(q);workbookStep='heading';continue;
+      }
+    }
+    if(layout==='workbook'&&active){
+      if(/^(?:독서|문학)[┃|]/.test(tr)){active=false;continue;}
+      const am=tr.match(/^[|｜]\s*정답\s*([①②③④⑤])/);if(am){answer=am[1];workbookStep='prompt';workbookChoice=0;continue;}
+      if(workbookStep==='heading')continue;
+      if(workbookStep==='prompt'){workbookStep='option';continue;}
+      if(workbookStep==='option'&&workbookChoice<5){
+        const op=t.match(/^\s*([①②③④⑤])\s*/);choice=op?op[1]:choices[workbookChoice];
+        // Only the correct option is allowed to omit its printed choice marker.
+        if(op||choice===answer){add(p,op?op[0].length:0,t.length,'option',q+'번 '+choice+' 선지');workbookChoice=choices.indexOf(choice)+1;workbookStep='explanation';continue;}
+        workbookStep='explanation';choice='';
+      }else if(workbookStep==='explanation')workbookStep='option';
+    }
     if(/주요\s*지문\s*분석|^지문\s*분석(?:지)?$/.test(tr)){analysis=true;pn=0;q=0;continue;}
     let m=tr.match(rangeRE);if(m){range=m[1]+'-'+m[2];q=+m[1]-1;part='';pn=0;first=false;active=true;subject=tr.slice(m[0].length);if(+m[1]<35)track='공통';continue;}
     if(!active)continue;
@@ -76,7 +108,7 @@ function targetData(doc,source=null){const items=[],questions=new Set();let rang
     if(layout==='inline'&&op&&tr.length>8){add(p,op[0].length,t.length,'option',q+'번 '+choice+' 선지');continue;}
     if(layout==='inline'&&/^\s*ⓑ\s*[:：]/.test(t)&&choice){add(p,0,t.length,'option-cont',q+'번 '+choice+' 선지 ⓑ');continue;}
     if(layout==='inline'&&/^\s*<보기>/.test(t)){const start=t.indexOf('<보기>')+4;let cursor=start;for(const e of t.slice(start).matchAll(/\(\s*[…⋯]+\s*\)|[…⋯]+|\.{3,}/g)){add(p,cursor,start+e.index,'view',q+'번 <보기> 발췌');cursor=start+e.index+e[0].length;}add(p,cursor,t.length,'view',q+'번 <보기> 발췌');continue;}
-    if(layout==='separate'||/^\s*▶/.test(t)){for(const quote of t.matchAll(/‘([^’]*)’|“([^”]*)”|「([^」]*)」|『([^』]*)』/g)){const inner=quote[1]??quote[2]??quote[3]??quote[4];if(!norm(inner))continue;const tail=t.slice(quote.index+quote[0].length,quote.index+quote[0].length+30);const definition=/^\s*(?:라는|라는? 뜻|의|이라는|란)?\s*(?:의미|뜻)/.test(tail);add(p,quote.index+1,quote.index+1+inner.length,definition?'definition':'quote',q+'번 '+choice+(definition?' 뜻풀이':' 해설 인용'),{short:norm(inner).length<8});}}
+    if(layout==='separate'||layout==='workbook'||/^\s*▶/.test(t)){for(const quote of t.matchAll(/‘([^’]*)’|“([^”]*)”|「([^」]*)」|『([^』]*)』/g)){const inner=quote[1]??quote[2]??quote[3]??quote[4];if(!norm(inner))continue;const tail=t.slice(quote.index+quote[0].length,quote.index+quote[0].length+30);const definition=/^\s*(?:라는|라는? 뜻|의|이라는|란)?\s*(?:의미|뜻)/.test(tail);add(p,quote.index+1,quote.index+1+inner.length,definition?'definition':'quote',q+'번 '+choice+(definition?' 뜻풀이':' 해설 인용'),{short:norm(inner).length<8});}}
   }return {items,available:[...questions].sort((a,b)=>a-b),layout};
 }
 function windows(blocks,text){let count=sentences(text).length,out=[];for(const b of blocks){let ss=sentences(b.text);for(let i=0;i<ss.length;i++)for(let size=Math.max(1,count-1);size<=count+1&&i+size<=ss.length;size++)out.push({...b,text:b.text.slice(ss[i].start,ss[i+size-1].end),sn:i+1});}return out;}
